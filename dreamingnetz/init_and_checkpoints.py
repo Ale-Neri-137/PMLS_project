@@ -1,20 +1,13 @@
-"""
-SysConfig + initialization + checkpoint I/O for DreamingNetz.
-
-This file is meant to be *import-safe*: it defines helpers and APIs, but does not
-run simulations at import time.
-"""
 
 from __future__ import annotations
-
-from dataclasses import dataclass
-import hashlib
+from dataclasses import dataclass, field
 import os
-import tempfile
-import shutil
-from typing import Any
-
 import numpy as np
+from numpy.typing import NDArray
+import numpy as np
+
+
+from .RNG_helpers import derive_xorshift_state
 
 # ---------------------------------------------------------------------------
 # Configs
@@ -22,26 +15,90 @@ import numpy as np
 
 @dataclass(frozen=True)
 class SysConfig:
-    N: int; P: int; K: int
-    t: float
-    c: float 
-    β: np.ndarray            # (K,)
-    mu_to_store: np.ndarray  # e.g. [0]
+    N: int
+    P: int
+
+    t_grid: NDArray[np.float64]      # (B,)
+    K: NDArray[np.int64]             # (B,)
+    beta_by_t: tuple[NDArray[np.float64], ...]
+    c: float
+    mu_to_store: NDArray[np.int64]
     master_seed: int
-    spin_init_mode: str = "random"   # this can be changed for different experiments
+    spin_init_mode: str = "random"
+
+    # derived
+    B: int = field(init=False)
+    R: int = field(init=False)
+    k_start: NDArray[np.int64] = field(init=False)
+    beta: NDArray[np.float64] = field(init=False)
+    b_of_r: NDArray[np.int64] = field(init=False)
 
     def __post_init__(self):
-        beta = np.ascontiguousarray(np.asarray(self.β, dtype=np.float64))
-        mu   = np.ascontiguousarray(np.asarray(self.mu_to_store, dtype=np.int64))
-        if beta.ndim != 1 or beta.size != self.K: raise ValueError("β must be 1D(K)")
-        if mu.size == 0: mu = np.array([0], dtype=np.int64)
-        if np.any((mu < 0) | (mu >= self.P)): raise ValueError("mu out of range")
-        object.__setattr__(self, "β", beta)
+        # Basic scalars
+        if self.N <= 0 or self.P <= 0:
+            raise ValueError("N, P must be positive")
+        c = float(self.c)
+        if not (0.0 <= c <= 1.0):
+            raise ValueError("c must be in [0,1]")
+        object.__setattr__(self, "c", c)
+
+        # t grid
+        t_grid = np.ascontiguousarray(np.asarray(self.t_grid, dtype=np.float64))
+        if t_grid.ndim != 1 or t_grid.size == 0:
+            raise ValueError("t_grid must be 1D and non-empty")
+        B = int(t_grid.size)
+        object.__setattr__(self, "t_grid", t_grid)
+        object.__setattr__(self, "B", B)
+
+        # K
+        K = np.ascontiguousarray(np.asarray(self.K, dtype=np.int64))
+        if K.ndim != 1 or K.size != B:
+            raise ValueError("K must be 1D with same length as t_grid")
+        if np.any(K <= 0):
+            raise ValueError("All K_b must be positive")
+        object.__setattr__(self, "K", K)
+
+        # mu_to_store
+        mu = np.ascontiguousarray(np.asarray(self.mu_to_store, dtype=np.int64))
+        if mu.size == 0:
+            mu = np.array([0], dtype=np.int64)
+        if np.any((mu < 0) | (mu >= self.P)):
+            raise ValueError("mu_to_store contains indices out of range [0,P)")
         object.__setattr__(self, "mu_to_store", np.unique(mu))
 
-        c = float(self.c)
-        if not (0.0 <= c <= 1.0): raise ValueError("c must be in [0,1]")
-        object.__setattr__(self, "c", c)
+        # k_start and R
+        k_start = np.empty(B + 1, dtype=np.int64)
+        k_start[0] = 0
+        for b in range(B):
+            k_start[b + 1] = k_start[b] + K[b]
+        R = int(k_start[B])
+        object.__setattr__(self, "k_start", np.ascontiguousarray(k_start))
+        object.__setattr__(self, "R", R)
+
+        # beta_by_t normalization + flatten
+        if len(self.beta_by_t) != B:
+            raise ValueError("beta_by_t must have length B")
+
+        beta_flat = np.empty(R, dtype=np.float64)
+        beta_by_t_norm = []
+
+        for b in range(B):
+            bet = np.ascontiguousarray(np.asarray(self.beta_by_t[b], dtype=np.float64))
+            if bet.ndim != 1 or bet.size != K[b]:
+                raise ValueError(f"beta_by_t[{b}] must be 1D of length K[{b}]={K[b]}")
+            beta_flat[k_start[b]:k_start[b+1]] = bet
+            beta_by_t_norm.append(bet)
+
+        object.__setattr__(self, "beta", np.ascontiguousarray(beta_flat))
+        object.__setattr__(self, "beta_by_t", tuple(beta_by_t_norm))
+
+
+        # optional lookup b_of_r (useful everywhere)
+        b_of_r = np.empty(R, dtype=np.int64)
+        for b in range(B):
+            for r in range(k_start[b], k_start[b+1]):
+                b_of_r[r] = b
+        object.__setattr__(self, "b_of_r", np.ascontiguousarray(b_of_r))
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -61,37 +118,6 @@ class RunConfig:
 # ---------------------------------------------------------------------------
 # Seeding / init
 # ---------------------------------------------------------------------------
-
-MASK64 = (1 << 64) - 1
-
-def splitmix64_py(x: int) -> int:
-    z = (x + 0x9E3779B97F4A7C15) & MASK64
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
-    return (z ^ (z >> 31)) & MASK64
-
-def tag_to_u64(tag) -> int:
-    h = hashlib.blake2b(digest_size=8)
-    if isinstance(tag, (int, np.integer)):
-        h.update(b'i'); h.update(int(tag).to_bytes(8, 'little', signed=False))
-    else:
-        b = str(tag).encode('utf-8')
-        h.update(b's'); h.update(len(b).to_bytes(4, 'little')); h.update(b)
-    return int.from_bytes(h.digest(), 'little')
-
-def derive_xorshift_state(master_seed: int, tag_tuple) -> np.ndarray:
-    x = int(master_seed) & MASK64
-    for t in tag_tuple:
-        x ^= tag_to_u64(t)
-        x = splitmix64_py(x); x = splitmix64_py(x)
-    s0 = splitmix64_py(x)
-    s1 = splitmix64_py(s0 ^ x)
-    if (s0 | s1) == 0:
-        s1 = 1
-    return np.array([np.uint64(s0), np.uint64(s1)], dtype=np.uint64)
-
-
-
 
 def sample_ξ(N, P, master_seed, rid, c: float = 0.0):
 
@@ -118,48 +144,37 @@ def sample_ξ(N, P, master_seed, rid, c: float = 0.0):
 
     return (eta[:, None] * s).astype(np.int8)
 
-
 def init_spins(sys: SysConfig, rid: int, xi: np.ndarray) -> np.ndarray:
     """
-    Returns Σ with shape (2, K, N), dtype=int8.
-    Uses sys.spin_init_mode to choose the strategy.
-    Modes now: "random".
+    Returns Σ with shape (2, R, N), dtype=int8.
     """
-    Σ = np.empty((2, sys.K, sys.N), dtype=np.int8)
+    Σ = np.empty((2, sys.R, sys.N), dtype=np.int8)
 
     if sys.spin_init_mode == "random":
-        for b in (0, 1):
-            rng = np.random.default_rng(int(derive_xorshift_state(sys.master_seed, (rid, b, "sigma"))[0]))
-            Σ[b] = (rng.integers(0, 2, size=(sys.K, sys.N), dtype=np.int8) * 2 - 1)
+        for chain in (0, 1):
+            for r in range(sys.R):
+                rng = np.random.default_rng(
+                    int(derive_xorshift_state(sys.master_seed, (rid, chain, r, "sigma"))[0])
+                )
+                Σ[chain, r] = (rng.integers(0, 2, size=sys.N, dtype=np.int8) * 2 - 1).astype(np.int8)
 
-    
     elif sys.spin_init_mode.startswith("corrupted"):
+        target = xi[:, 0]  # pattern 0
 
-        target = xi[:, 0] # Target pattern 0
-        
-        # 2. Parse noise level (e.g., "corrupted_0.10")
         try:
             noise_level = float(sys.spin_init_mode.split("_")[1])
-        except:
-            noise_level = 0.10 # Default 10%
-            
-        # 3. Create corrupted replicas
-        for b in (0, 1):
-            # Deterministic seed for flips
+        except Exception:
+            noise_level = 0.10
+
+        base_config = np.tile(target, (sys.R, 1)).astype(np.int8)
+
+        for chain in (0, 1):
             rng = np.random.default_rng(
-                int(derive_xorshift_state(sys.master_seed, (rid, b, "sigma_init"))[0])
+                int(derive_xorshift_state(sys.master_seed, (rid, chain, "sigma_init"))[0])
             )
-            
-            # Broadcast target to (K, N)
-            base_config = np.tile(target, (sys.K, 1))
-            
-            # Generate flip mask
-            flips = rng.random(size=(sys.K, sys.N)) < noise_level
-            
-            # Apply flips: sigma = xi * (-1 if flip else 1)
-            # -1 * 1 = -1 (flip), 1 * 1 = 1 (keep)
+            flips = rng.random(size=(sys.R, sys.N)) < noise_level
             modifiers = np.where(flips, -1, 1).astype(np.int8)
-            Σ[b] = base_config * modifiers
+            Σ[chain] = base_config * modifiers
 
     else:
         raise ValueError(f"Unknown spin_init_mode: {sys.spin_init_mode!r}")
@@ -167,12 +182,31 @@ def init_spins(sys: SysConfig, rid: int, xi: np.ndarray) -> np.ndarray:
     return Σ
 
 
+
+
 def _make_seed_matrix(sys: SysConfig, rid: int) -> np.ndarray:
-    seeds = np.empty((2, sys.K + 1, 2), dtype=np.uint64)
-    for b in (0,1):
-        for k in range(sys.K):
-            seeds[b, k] = derive_xorshift_state(sys.master_seed, (rid, b, k, "spin"))
-        seeds[b, -1] = derive_xorshift_state(sys.master_seed, (rid, b, "swap"))
+    """
+    seeds shape: (2, R + B + 1, 2)
+
+    Indexing convention (matches your jitted code):
+      seeds[chain, r]         : local Metropolis RNG for slot r
+      seeds[chain, R + b]     : horizontal swaps RNG for ladder b
+      seeds[chain, R + B]     : vertical swaps RNG (shared across all vertical edges)
+    """
+    seeds = np.empty((2, sys.R + sys.B + 1, 2), dtype=np.uint64)
+
+    for chain in (0, 1):
+        # local streams
+        for r in range(sys.R):
+            seeds[chain, r] = derive_xorshift_state(sys.master_seed, (rid, chain, r, "spin"))
+
+        # horizontal swap streams (one per b)
+        for b in range(sys.B):
+            seeds[chain, sys.R + b] = derive_xorshift_state(sys.master_seed, (rid, chain, b, "hswap"))
+
+        # vertical swap stream
+        seeds[chain, sys.R + sys.B] = derive_xorshift_state(sys.master_seed, (rid, chain, "vswap"))
+
     return seeds
 
 # ---------------------------------------------------------------------------
@@ -203,24 +237,51 @@ def build_A_and_Jdiag(G: np.ndarray, ξ: np.ndarray):
     Jd = np.ascontiguousarray(Jd, dtype=np.float64)
     return A, Jd
 
+def build_couplings_for_t_grid(ξ: np.ndarray, t_grid: np.ndarray):
+    """
+    Returns:
+      G_all : (B, P, P) float64
+      A_all : (B, N, P) float64
+      d_all : (B, N)    float64   (J_diag per t)
+    """
+    t_grid = np.ascontiguousarray(np.asarray(t_grid, dtype=np.float64))
+    B = t_grid.size
+    N, P = ξ.shape
+
+    G_all = np.empty((B, P, P), dtype=np.float64)
+    A_all = np.empty((B, N, P), dtype=np.float64)
+    d_all = np.empty((B, N),    dtype=np.float64)
+
+    for b in range(B):
+        Gb = build_G_t(ξ, float(t_grid[b]))
+        Ab, db = build_A_and_Jdiag(Gb, ξ)
+        G_all[b] = Gb
+        A_all[b] = Ab
+        d_all[b] = db
+
+    return (np.ascontiguousarray(G_all),
+            np.ascontiguousarray(A_all),
+            np.ascontiguousarray(d_all))
+
 
 def compute_M_from_σ_ξ(σ: np.ndarray, ξ: np.ndarray) -> np.ndarray:
     """
-    σ: (K, N) ±1 int8; ξ: (N, P) ±1 int8
-    Returns M: (K, P) float64 where M[k, mu] = (1/N) sum_i ξ[i,mu] * σ[k,i]
+    σ: (L, N) ±1 int8   (L can be K_b or R)
+    ξ: (N, P) ±1 int8
+    Returns M: (L, P) float64 with M[l,mu] = (1/N) Σ_i σ[l,i] ξ[i,mu]
     """
     N, P = ξ.shape
-    S = σ.astype(np.float64)  # (K, N)
-    X = ξ.astype(np.float64)   # (N, P)
-    return (S @ X) / float(N)   # (K, P)
+    S = σ.astype(np.float64, copy=False)   # (L, N)
+    X = ξ.astype(np.float64, copy=False)   # (N, P)
+    return (S @ X) / float(N)              # (L, P)
 
 def compute_E_from_M(M: np.ndarray, G: np.ndarray, N: int) -> np.ndarray:
     """
-    M: (K, P) ; G: (P, P)
-    H = -N/2 * sum_μ,ν M_μ G_μ,ν M_ν  per K
+    M: (L, P) ; G: (P, P)
+    E_l = -N/2 * M_l^T G M_l
     """
-    MG = M @ G    # (K, P)
-    return -0.5 * N * np.einsum("kp,kp->k", M, MG)
+    MG = M @ G
+    return -0.5 * N * np.einsum("lp,lp->l", M, MG)
 
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
@@ -235,7 +296,7 @@ def ensure_dir(p: str) -> None:
 def realization_dir(run_root: str, rid: int) -> str:
     return os.path.join(run_root, f"r{rid:03d}")
 
-#The first verion (truly atomic) works on native Linux systems, not on WSL
+#The first version (truly atomic) works on native Linux systems, not on WSL
 """
 def atomic_save_npz(path: str, **arrays) -> None:
     d = os.path.dirname(path); ensure_dir(d)
@@ -262,108 +323,195 @@ def atomic_save_npz(path: str, **arrays) -> None:
     # but closing np.savez usually flushes enough for this context)
 
 
-def save_disorder(rdir: str, ξ: np.ndarray, t: float) -> None:
+def save_disorder(rdir: str, ξ: np.ndarray) -> None:
     atomic_save_npz(os.path.join(rdir, "disorder.npz"),
-                    ξ=ξ.astype(np.int8, copy=False), t=np.float64(t))
+                    ξ=ξ.astype(np.int8, copy=False))
 
-def load_disorder(rdir: str) -> tuple[np.ndarray, float]:
+def load_disorder(rdir: str) -> np.ndarray:
     z = np.load(os.path.join(rdir, "disorder.npz"))
-    return z["ξ"].astype(np.int8, copy=False), float(z["t"])
+    return z["ξ"].astype(np.int8, copy=False)
+
 
 
 def save_sysconfig(rdir: str, sys: SysConfig) -> None:
     atomic_save_npz(
         os.path.join(rdir, "sysconfig.npz"),
-        N=np.int64(sys.N), P=np.int64(sys.P), K=np.int64(sys.K),
-        t=np.float64(sys.t), c=np.float64(sys.c),
+        N=np.int64(sys.N),
+        P=np.int64(sys.P),
+        t_grid=np.ascontiguousarray(sys.t_grid, dtype=np.float64),
+        K=np.ascontiguousarray(sys.K, dtype=np.int64),
+        c=np.float64(sys.c),
         master_seed=np.int64(sys.master_seed),
-        beta=np.ascontiguousarray(sys.β, dtype=np.float64),
+        beta=np.ascontiguousarray(sys.beta, dtype=np.float64),  # flat (R,)
         mu=np.ascontiguousarray(sys.mu_to_store, dtype=np.int64),
         spin_init_mode=np.array(sys.spin_init_mode, dtype="U"),
     )
 
 def load_sysconfig(rdir: str) -> SysConfig:
-    """
-    If sysconfig.npz is missing, you must be in fresh mode (provide SysConfig). Otherwise it’s an error.
-    """
     z = np.load(os.path.join(rdir, "sysconfig.npz"))
+
+    t_grid = z["t_grid"].astype(np.float64, copy=False)
+    K      = z["K"].astype(np.int64, copy=False)
+    beta   = z["beta"].astype(np.float64, copy=False)  # flat (R,)
+
+    # Rebuild beta_by_t from flat beta + K (works with your ragged ladders)
+    k_start = np.insert(np.cumsum(K), 0, 0)
+    beta_by_t = tuple(beta[k_start[b]:k_start[b+1]] for b in range(K.shape[0]))
+    sim = z["spin_init_mode"]
+    spin_init_mode = str(sim.item()) if sim.size == 1 else str(sim)
+
     return SysConfig(
-        N=int(z["N"]), P=int(z["P"]), K=int(z["K"]),
-        t=float(z["t"]), c=float(z["c"]),
+        N=int(z["N"]),
+        P=int(z["P"]),
+        t_grid=t_grid,
+        K=K,
+        beta_by_t=beta_by_t,             # <-- if your SysConfig takes ragged input
+        c=float(z["c"]),
         master_seed=int(z["master_seed"]),
-        β=z["beta"].astype(np.float64, copy=False),
         mu_to_store=z["mu"].astype(np.int64, copy=False),
-        spin_init_mode=str(z["spin_init_mode"]),
+        spin_init_mode=spin_init_mode,
     )
 
 
-def save_checkpoint(rdir: str, state: dict, n_done: int, β: np.ndarray) -> None:
-    atomic_save_npz(os.path.join(rdir, "checkpoint.npz"),
+def save_checkpoint(rdir: str, state: dict, n_done: int) -> None:
+    atomic_save_npz(
+        os.path.join(rdir, "checkpoint.npz"),
         Σ=state["Σ"], M=state["M"], Ξ=state["Ξ"], Ψ=state["Ψ"],
-        seeds=state["seeds"], n_swaps=state["n_swaps"],
-        β=np.ascontiguousarray(β, dtype=np.float64),
+        seeds=state["seeds"],
+        swap_count=state["swap_count"],
+        vertical_swap_count=state["vertical_swap_count"],
+        vertical_swap_attempt=state["vertical_swap_attempt"],
         n_done=np.int64(n_done),
     )
 
 def load_checkpoint(rdir: str):
     z = np.load(os.path.join(rdir, "checkpoint.npz"))
-    state = {"Σ": z["Σ"], "M": z["M"], "Ξ": z["Ξ"], "Ψ": z["Ψ"],
-             "seeds": z["seeds"], "n_swaps": z["n_swaps"], "β": z["β"]}
+    state = {
+        "Σ": z["Σ"], "M": z["M"], "Ξ": z["Ξ"], "Ψ": z["Ψ"],
+        "seeds": z["seeds"],
+        "swap_count": z["swap_count"],
+        "vertical_swap_count": z["vertical_swap_count"],
+        "vertical_swap_attempt": z["vertical_swap_attempt"],
+    }
     return state, int(z["n_done"])
+
+def save_edges(rdir: str, edge_list: np.ndarray) -> None:
+    edge_list = np.ascontiguousarray(edge_list, dtype=np.int64)
+    atomic_save_npz(os.path.join(rdir, "edges.npz"), edge_list=edge_list)
+
+def load_edges(rdir: str) -> np.ndarray:
+    z = np.load(os.path.join(rdir, "edges.npz"))
+    return z["edge_list"].astype(np.int64, copy=False)
 
 # ---------------------------------------------------------------------------
 # Start / resume APIs
 # ---------------------------------------------------------------------------
 
 def start_fresh(run_root: str, rid: int, sys: SysConfig, run: RunConfig):
-    rdir = realization_dir(run_root, rid); ensure_dir(rdir)
+    rdir = realization_dir(run_root, rid)
+    ensure_dir(rdir)
 
     save_sysconfig(rdir, sys)
 
+    # disorder
     ξ = sample_ξ(sys.N, sys.P, sys.master_seed, rid, sys.c)
-    save_disorder(rdir, ξ, sys.t)
-    G = build_G_t(ξ, sys.t); A, d = build_A_and_Jdiag(G, ξ)
+    save_disorder(rdir, ξ)  # (no scalar t anymore)
 
-    Σ = init_spins(sys, rid, ξ)   # ← uses sys.spin_init_mode
+    # edges (production assumption: you already have them)
+    edge_list = load_edges(rdir)  # or: edge_list = sys.edge_list
+    edge_list = np.ascontiguousarray(edge_list, dtype=np.int64)
+    if edge_list.ndim != 2 or edge_list.shape[1] != 2:
+        raise ValueError("edge_list must be (E,2)")
+    if edge_list.size:
+        if edge_list.min() < 0 or edge_list.max() >= sys.R:
+            raise ValueError("edge_list has node outside [0, R)")
 
-    M = np.empty((2, sys.K, sys.P), dtype=np.float64)
-    Ξ = np.empty((2, sys.K), dtype=np.float64)
-    for b in (0, 1):
-        M[b] = compute_M_from_σ_ξ(Σ[b], ξ)
-        Ξ[b] = compute_E_from_M(M[b], G, sys.N)
+    E = edge_list.shape[0]
 
-    Ψ = np.tile(np.arange(sys.K, dtype=np.int64), (2, 1))
-    seeds = _make_seed_matrix(sys, rid)
-    n_swaps = np.zeros((2, sys.K - 1), dtype=np.int64)
+    # couplings for all t_b
+    G_all, A, d = build_couplings_for_t_grid(ξ, sys.t_grid)  # A:(B,N,P), d:(B,N)
 
-    #this will be untouched, initialization sanity check
+    # init state over all slots r
+    Σ = init_spins(sys, rid, ξ)  # (2,R,N)
+
+    M = np.empty((2, sys.R, sys.P), dtype=np.float64)
+    Ξ = np.empty((2, sys.R), dtype=np.float64)
+
+    for chain in (0, 1):
+        for b in range(sys.B):
+            r0, r1 = sys.k_start[b], sys.k_start[b+1]
+            M[chain, r0:r1] = compute_M_from_σ_ξ(Σ[chain, r0:r1], ξ)
+            Ξ[chain, r0:r1] = compute_E_from_M(M[chain, r0:r1], G_all[b], sys.N)
+
+    Ψ = np.tile(np.arange(sys.R, dtype=np.int64), (2, 1))
+    seeds = _make_seed_matrix(sys, rid)  # (2, R+B+1, 2)
+
+    # swap stats
+    swap_count = np.zeros((2, sys.R - 1), dtype=np.int64)       # horizontal
+    vertical_swap_count   = np.zeros((2, E), dtype=np.int64)    # per-edge accepted
+    vertical_swap_attempt = np.zeros((2, E), dtype=np.int64)    # per-edge attempted
+
     atomic_save_npz(os.path.join(rdir, "checkpoint_init.npz"),
-        Σ=Σ, M=M, Ξ=Ξ, Ψ=Ψ, seeds=seeds, n_swaps=n_swaps,
-        n_done=np.int64(0), β=np.ascontiguousarray(sys.β, dtype=np.float64))
-    
-    #this will be overwritten after thermalization
-    save_checkpoint(rdir,
-        {"Σ": Σ, "M": M, "Ξ": Ξ, "Ψ": Ψ, "seeds": seeds, "n_swaps": n_swaps},
-        n_done=0, β=sys.β)
+        Σ=Σ, M=M, Ξ=Ξ, Ψ=Ψ, seeds=seeds,
+        swap_count=swap_count,
+        vertical_swap_count=vertical_swap_count,
+        vertical_swap_attempt=vertical_swap_attempt,
+        n_done=np.int64(0),
+    )
 
-    return dict(mode="fresh", rdir=rdir, sys=sys, ξ=ξ, G=G, A=A, d=d,
-                Σ=Σ, M=M, Ξ=Ξ, Ψ=Ψ, seeds=seeds, n_swaps=n_swaps, n_done=0)
+    save_checkpoint(rdir,
+        dict(Σ=Σ, M=M, Ξ=Ξ, Ψ=Ψ,
+             seeds=seeds,
+             swap_count=swap_count,
+             vertical_swap_count=vertical_swap_count,
+             vertical_swap_attempt=vertical_swap_attempt),
+        n_done=0,
+    )
+
+    return dict(mode="fresh", rdir=rdir, sys=sys,
+                ξ=ξ, G_all=G_all, A=A, d=d,
+                Σ=Σ, M=M, Ξ=Ξ, Ψ=Ψ,
+                seeds=seeds,
+                swap_count=swap_count,
+                vertical_swap_count=vertical_swap_count,
+                vertical_swap_attempt=vertical_swap_attempt,
+                edge_list=edge_list,
+                n_done=0)
+
 
 def resume(path_to_realization: str, run: RunConfig):
     rdir = path_to_realization
 
-    # Load physics from disk 
     sys = load_sysconfig(rdir)
+    ξ = load_disorder(rdir)
 
-    # Rebuild couplings from stored disorder
-    ξ, t = load_disorder(rdir)
-    if float(t) != float(sys.t):
-        raise RuntimeError("Stored disorder t != sys.t (this should not happen).")
-    G = build_G_t(ξ, t); A, d = build_A_and_Jdiag(G, ξ)
+    edge_list = load_edges(rdir)  # or sys.edge_list
+    edge_list = np.ascontiguousarray(edge_list, dtype=np.int64)
+    E = edge_list.shape[0]
+
+    G_all, A, d = build_couplings_for_t_grid(ξ, sys.t_grid)
 
     state, n_done = load_checkpoint(rdir)
-    Σ, M, Ξ, Ψ = state["Σ"], state["M"], state["Ξ"], state["Ψ"]
-    seeds, n_swaps = state["seeds"], state["n_swaps"]
+    
+    if state["vertical_swap_count"].shape[1] != E or state["vertical_swap_attempt"].shape[1] != E:
+        raise RuntimeError("edge_list length changed vs checkpoint")
 
-    return dict(mode="resume", rdir=rdir, sys=sys, ξ=ξ, G=G, A=A, d=d,
-                Σ=Σ, M=M, Ξ=Ξ, Ψ=Ψ, seeds=seeds, n_swaps=n_swaps, n_done=n_done)
+    # optional: ensure horizontal counter length matches current sys.R
+    if state["swap_count"].shape[1] != sys.R - 1:
+        raise RuntimeError("swap_count length changed vs sys.R")
+
+
+    # (optional) assert checkpoint shapes match current E
+    if state["vertical_swap_count"].shape[1] != E:
+        raise RuntimeError("edge_list length changed vs checkpoint")
+
+    return dict(mode="resume", rdir=rdir, sys=sys,
+                ξ=ξ, G_all=G_all, A=A, d=d,
+                Σ=state["Σ"], M=state["M"], Ξ=state["Ξ"], Ψ=state["Ψ"],
+                seeds=state["seeds"],
+                swap_count=state["swap_count"],
+                vertical_swap_count=state["vertical_swap_count"],
+                vertical_swap_attempt=state["vertical_swap_attempt"],
+                edge_list=edge_list,
+                n_done=n_done)
+

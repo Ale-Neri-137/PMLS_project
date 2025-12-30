@@ -5,40 +5,78 @@ This module handles:
 - resuming progress from chunk files + checkpoints
 - running one realization per process via ProcessPoolExecutor
 
+Notes:
+- This module *expects* the following symbols to be importable (adjust imports as needed):
+    - Simulate_two_replicas  (your Numba kernel)
+    - realization_dir, start_fresh, resume, save_checkpoint (I/O + state)
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 
-
+# ---- Optional explicit imports (edit these to match your package layout) ----
 from .jitted_kernel import Simulate_two_replicas
 from .init_and_checkpoints import realization_dir, start_fresh, resume, save_checkpoint
-from .I_O_helpers import _atomic_save_npy, has_valid_sysconfig, ensure_edges_file, reconcile_n_done
 
+
+# ----------------------------- Atomic writes -----------------------------
+
+def _fsync_dir(dirpath: str) -> None:
+    """Best-effort directory fsync for crash-safety."""
+    try:
+        dirfd = os.open(dirpath, os.O_DIRECTORY)  # type: ignore[attr-defined]
+    except Exception:
+        return
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+
+
+def _atomic_save_npy(path: str, arr: np.ndarray) -> None:
+    """Atomically write a .npy file (write temp, validate, replace)."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+    fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".npy", dir=d or None)
+    os.close(fd)
+    try:
+        np.save(tmp, arr)
+        # sanity check: ensure file is readable (catches partial writes)
+        np.load(tmp, mmap_mode="r")
+        os.replace(tmp, path)
+        if d:
+            _fsync_dir(d)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 class ChunkWriter:
     """
     Writes per-chunk files:
         timeseries/
-          {start:09d}.E.npy      shape (2, T, R)
-          {start:09d}.q01.npy    shape (T, R)
-          {start:09d}.m_sel.npy  shape (2, T, R, P_sel)
+          E.{start:09d}.npy      shape (2, T, K)
+          q01.{start:09d}.npy    shape (T, K)
+          m_sel.{start:09d}.npy  shape (2, T, K, P_sel)  (optional)
     """
-    def __init__(self, rdir: str, R: int, P_sel: int, store_m_sel: bool = True):
+    def __init__(self, rdir: str, K: int, P_sel: int, store_m_sel: bool = True):
         self.base = os.path.join(rdir, "timeseries")
-        self.R = int(R)
+        self.K = int(K)
         self.P_sel = int(P_sel)
         self.store_m_sel = bool(store_m_sel)
         os.makedirs(self.base, exist_ok=True)
-
 
     def write(self, start_idx: int,
               E_chunk: np.ndarray,      # (2, T, K)
@@ -55,6 +93,10 @@ class ChunkWriter:
             _atomic_save_npy(pref + ".m_sel.npy", m_sel_chunk)
 
 
+# %% [markdown]
+# ## The chunked simulation loop
+
+# %%
 def run_chunked(state: dict, run, *, rid: int | None = None, log_every_chunk: bool = True):
     """
     Works for both fresh and resume states:
@@ -67,13 +109,8 @@ def run_chunked(state: dict, run, *, rid: int | None = None, log_every_chunk: bo
     sys = state["sys"]
     rdir = state["rdir"]
     Σ, M, Ξ, Ψ = state["Σ"], state["M"], state["Ξ"], state["Ψ"]
-    seeds = state["seeds"]
-    swap_count = state["swap_count"]
-    vertical_swap_count = state["vertical_swap_count"]
-    vertical_swap_attempt = state["vertical_swap_attempt"]
-    edge_list = state["edge_list"]
+    seeds, n_swaps = state["seeds"], state["n_swaps"]
     ξ, A, d = state["ξ"], state["A"], state["d"]
-
 
     invN = 1.0 / float(sys.N)
     n_done = int(state["n_done"])
@@ -81,46 +118,33 @@ def run_chunked(state: dict, run, *, rid: int | None = None, log_every_chunk: bo
 
     # Prepare writer
     P_sel = int(sys.mu_to_store.size)
-    writer = ChunkWriter(rdir, R=sys.R, P_sel=P_sel, store_m_sel=True)
-
+    writer = ChunkWriter(rdir, K=sys.K, P_sel=P_sel, store_m_sel=True)
 
     # One-time equilibration if FRESH and n_done == 0
     if state.get("mode") == "fresh" and n_done == 0 and run.equilibration_time > 0:
         t_eq0 = time.perf_counter()
         # We can simply call the kernel with N_data=0 and eq_time>0
         Simulate_two_replicas(
-            sys.N, sys.P, sys.R, invN,
-            sys.K,                       # int64[B]
+            sys.N, sys.P, sys.K, invN,
             Σ, M, Ξ, Ψ,
             A, ξ, d,
-            np.ascontiguousarray(sys.beta, dtype=np.float64),   # flat (R,)
+            np.ascontiguousarray(sys.β, dtype=np.float64),
             seeds,
-            run.equilibration_time,
-            run.sampling_interval,       # irrelevant when N_data=0
-            0,                           # N_data=0: only equilibrate
-            np.empty((2, 0, sys.R), dtype=np.float64),
-            np.empty((2, 0, sys.R, P_sel), dtype=np.float64),
+            run.equilibration_time,  # eq_time
+            run.sampling_interval,   # doesn’t matter for N_data=0
+            0,                       # N_data = 0 → only equilibrate
+            np.empty((2,0,sys.K), dtype=np.float64),
+            np.empty((2,0,sys.K,P_sel), dtype=np.float64),
             sys.mu_to_store.astype(np.int64, copy=False),
-            np.empty((0, sys.R), dtype=np.float64),
-            swap_count,
-            vertical_swap_count,
-            vertical_swap_attempt,
-            edge_list
+            np.empty((0,sys.K), dtype=np.float64),
+            n_swaps
         )
-
         # Reset swap counters after equilibration so production stats start clean
-        swap_count.fill(0)
-        vertical_swap_count.fill(0)
-        vertical_swap_attempt.fill(0)
+        n_swaps.fill(0)
         # Save a checkpoint *post*-equilibration
-        save_checkpoint(
-            rdir,
-            {"Σ": Σ, "M": M, "Ξ": Ξ, "Ψ": Ψ, "seeds": seeds,
-            "swap_count": swap_count,
-            "vertical_swap_count": vertical_swap_count,
-            "vertical_swap_attempt": vertical_swap_attempt},
-            n_done=n_done
-        )
+        save_checkpoint(rdir,
+            {"Σ": Σ, "M": M, "Ξ": Ξ, "Ψ": Ψ, "seeds": seeds, "n_swaps": n_swaps},
+            n_done=n_done, β=sys.β)
         if log_every_chunk:
             print(f"{prefix} [eq] t_eq={time.perf_counter()-t_eq0:.2f}s | n_done={n_done}", flush=True)
 
@@ -130,18 +154,17 @@ def run_chunked(state: dict, run, *, rid: int | None = None, log_every_chunk: bo
         start_idx = n_done
 
         # Allocate chunk buffers
-        E_chunk   = np.empty((2, take, sys.R), dtype=np.float64)
-        m_sel     = np.empty((2, take, sys.R, P_sel), dtype=np.float64)
-        q01_chunk = np.empty((take, sys.R), dtype=np.float64)
+        E_chunk   = np.empty((2, take, sys.K), dtype=np.float64)
+        m_sel     = np.empty((2, take, sys.K, P_sel), dtype=np.float64)
+        q01_chunk = np.empty((take, sys.K), dtype=np.float64)
 
         t_chunk = time.perf_counter()
-        # Fill via your kernel (does 3x MMC sweeps per sample internally)
+        # Fill via your kernel (does 2x MMC sweeps per sample internally)
         Simulate_two_replicas(
-            sys.N, sys.P, sys.R, invN,
-            sys.K,
+            sys.N, sys.P, sys.K, invN,
             Σ, M, Ξ, Ψ,
             A, ξ, d,
-            np.ascontiguousarray(sys.beta, dtype=np.float64),
+            np.ascontiguousarray(sys.β, dtype=np.float64),
             seeds,
             0,                       # eq_time handled outside
             run.sampling_interval,
@@ -149,32 +172,23 @@ def run_chunked(state: dict, run, *, rid: int | None = None, log_every_chunk: bo
             E_chunk, m_sel,
             sys.mu_to_store.astype(np.int64, copy=False),
             q01_chunk,
-            swap_count,
-            vertical_swap_count,
-            vertical_swap_attempt,
-            edge_list
+            n_swaps
         )
-
 
         # Persist this chunk
         writer.write(start_idx, E_chunk, q01_chunk, m_sel)
 
         # Update progress & checkpoint
         n_done += take
-        save_checkpoint(
-            rdir,
-            {"Σ": Σ, "M": M, "Ξ": Ξ, "Ψ": Ψ, "seeds": seeds,
-            "swap_count": swap_count,
-            "vertical_swap_count": vertical_swap_count,
-            "vertical_swap_attempt": vertical_swap_attempt},
-            n_done=n_done
-        )
+        save_checkpoint(rdir,
+            {"Σ": Σ, "M": M, "Ξ": Ξ, "Ψ": Ψ, "seeds": seeds, "n_swaps": n_swaps},
+            n_done=n_done, β=sys.β)
 
         if log_every_chunk:
             elapsed = time.perf_counter() - t_chunk
             total   = time.perf_counter() - t0
-            steps = max(1, n_done * run.sampling_interval)
-            acc   = float(swap_count.mean() / steps)   # rough, like before
+            steps   = max(1, n_done * run.sampling_interval)
+            acc     = float(n_swaps.mean() / steps)
             print(f"{prefix} [chunk] n_done={n_done}/{target} "
                   f"acc≈{acc:.3f} t_total={total/60:.1f}m", flush=True)
 
@@ -183,37 +197,80 @@ def run_chunked(state: dict, run, *, rid: int | None = None, log_every_chunk: bo
     return state
 
 
+# %% [markdown]
+# ## The runner and the orchestrator
+
+# %% [markdown]
+# #### Sanity checks when resuming
+
+# %%
+def safe_len_from_chunks(rdir: str) -> int:
+    """Reconstruct length from chunk files (most trustworthy for resume)."""
+    base = os.path.join(rdir, "timeseries")
+    if not os.path.isdir(base): return 0
+    starts = []
+    for name in os.listdir(base):
+        if name.endswith(".E.npy"):
+            stem = name[:-len(".E.npy")]
+            try: starts.append(int(stem))
+            except: pass
+    if not starts: return 0
+    total = 0
+    for s in sorted(starts):
+        E = np.load(os.path.join(base, f"{s:09d}.E.npy"), mmap_mode="r")
+        total = max(total, s + E.shape[1])
+    return total
+
+def reconcile_n_done(rdir: str, n_done_ckpt: int) -> int:
+    """Prefer the length implied by chunk files; warn if mismatch."""
+    n_files = safe_len_from_chunks(rdir)
+    if n_files != n_done_ckpt:
+        print(f"[reconcile] {os.path.basename(rdir)}: checkpoint n_done={n_done_ckpt} "
+              f"vs files={n_files} → using files", flush=True)
+    return n_files
 
 
 
-### The worker entry ( one process = one realization )
+# %%
+def has_valid_sysconfig(rdir: str) -> bool:
+    path = os.path.join(rdir, "sysconfig.npz")
+    if not os.path.exists(path):
+        return False
+    try:
+        z = np.load(path)
+        # touch required fields; will raise if corrupt/empty
+        _ = int(z["N"]); _ = int(z["P"]); _ = int(z["K"])
+        _ = float(z["t"]);_ = float(z["c"])
+        _ = int(z["master_seed"])
+        _ = z["beta"]; _ = z["mu"]
+        return True
+    except Exception:
+        return False
 
+
+# %% [markdown]
+# ### The worker entry ( one process = one realization )
+
+# %%
 def worker_run(rid: int, run, sys_if_needed):
     rdir = realization_dir(run.run_root, rid)
     ok = os.path.isdir(rdir) and has_valid_sysconfig(rdir)
 
     if ok:
-        # ensure edges exist in rdir for resume (harmless if already there)
-        ensure_edges_file(run.run_root, rdir)
         state = resume(rdir, run)
     else:
-        # folder missing or broken → wipe, then ensure edges, then fresh
+        # folder missing or has broken/empty sysconfig.npz → start fresh
         if os.path.isdir(rdir):
-            shutil.rmtree(rdir, ignore_errors=True)
-
+            shutil.rmtree(rdir, ignore_errors=True)  # wipe partial dir
         if sys_if_needed is None:
             raise RuntimeError(f"r{rid:03d}: need SysConfig for fresh start")
-
-        # IMPORTANT: copy edges AFTER wiping
-        ensure_edges_file(run.run_root, rdir)
-
         state = start_fresh(run.run_root, rid, sys_if_needed, run)
 
     # reconcile and run
-    n_done_ckpt = int(cast(int, state["n_done"]))
+    n_done_ckpt = int(cast(int, state["n_done"]))   
     state["n_done"] = reconcile_n_done(rdir, n_done_ckpt)
     t0 = time.perf_counter()
-    state = run_chunked(state, run, rid=rid)
+    state = run_chunked(state, run, rid = rid)
 
     return {
         "rid": rid,
@@ -224,14 +281,12 @@ def worker_run(rid: int, run, sys_if_needed):
 
 
 
+# %% [markdown]
+# ### The pool executor
 
-### The pool executor
-
+# %%
 def run_pool(run, sys_for_fresh, R_workers: int, R_total: int, start_method="fork"):
     os.makedirs(run.run_root, exist_ok=True)
-    if not os.path.exists(os.path.join(run.run_root, "edges.npz")):
-        raise RuntimeError("run_root/edges.npz missing: write tuned edge_list there before run_pool().")
-
     mpctx = get_context(start_method)
     results = []
     with ProcessPoolExecutor(max_workers=R_workers, mp_context=mpctx) as ex:
