@@ -44,7 +44,8 @@ def attempt_swap_1d(parity, K, E,I, β, seed_array, swap_count):
         float64[::1],                          # d
         float64[::1],                          # β
         uint64[:,::1],                         # seed_array
-        int64[::1]                             # swap_count
+        int64[::1],                            # swap_count
+        int8[:,::1],int64
     ),
     nogil=True, no_cpython_wrapper=True, fastmath=True
 )
@@ -52,7 +53,7 @@ def do_one_MMC_step_1d(
     N, P, K, invN,
     σ, m, E, I,
     A, ξ, d, 
-    β, seed_array, swap_count
+    β, seed_array, swap_count,I_ts,step
 ):
     """
     One MMC macro-step for ONE PT chain:
@@ -76,6 +77,8 @@ def do_one_MMC_step_1d(
 
     attempt_swap_1d(0, K, E, I, β, seed_array, swap_count)
 
+    I_ts[2*step]   = I
+
     # -------- second local sweep (then odd swaps) --------
     for k in range(K):
         rep_k = I[k]  # actual replica index currently sitting at slot k
@@ -90,6 +93,8 @@ def do_one_MMC_step_1d(
             )
 
     attempt_swap_1d(1, K, E, I, β, seed_array, swap_count)
+
+    I_ts[2*step+1] = I
 
 
 @njit(void( int64,int64,int64,float64,                                    # N,P,K,invN
@@ -113,13 +118,15 @@ def Simulate_two_replicas_stats_1d( N,P,K,invN,
                                  replica_swap_count,
                                  I_ts ):
     
-
+    scrap=np.zeros((2,K),dtype=np.int8)
 
     # --- equilibrate ---
     for _ in range(equilibration_time):
-        do_one_MMC_step_1d(N,P,K,invN, Σ[0],M[0],Ξ[0],Ψ[0], A,ξ,d, β, seed_matrix[0], replica_swap_count[0])
+        do_one_MMC_step_1d(N,P,K,invN, Σ[0],M[0],Ξ[0],Ψ[0], A,ξ,d, β, seed_matrix[0], replica_swap_count[0],
+                           scrap,0)
     for _ in range(equilibration_time):
-        do_one_MMC_step_1d(N,P,K,invN, Σ[1],M[1],Ξ[1],Ψ[1], A,ξ,d, β, seed_matrix[1], replica_swap_count[1])
+        do_one_MMC_step_1d(N,P,K,invN, Σ[1],M[1],Ξ[1],Ψ[1], A,ξ,d, β, seed_matrix[1], replica_swap_count[1],
+                           scrap,0)
 
     replica_swap_count.fill(0)
 
@@ -127,12 +134,18 @@ def Simulate_two_replicas_stats_1d( N,P,K,invN,
     for n in range(n_samples):
         # decorrelate between samples
         for t in range(sweeps_per_sample):
-            do_one_MMC_step_1d(N,P,K,invN, Σ[0],M[0],Ξ[0],Ψ[0], A,ξ,d, β, seed_matrix[0], replica_swap_count[0])
-            I_ts[0,sweeps_per_sample*n+t] = Ψ[0]
+
+            step = n * sweeps_per_sample + t
+            do_one_MMC_step_1d(N,P,K,invN, Σ[0],M[0],Ξ[0],Ψ[0], A,ξ,d, β, seed_matrix[0], replica_swap_count[0],
+                               I_ts[0],step)
+    
 
         for t in range(sweeps_per_sample):
-            do_one_MMC_step_1d(N,P,K,invN, Σ[1],M[1],Ξ[1],Ψ[1], A,ξ,d, β, seed_matrix[1], replica_swap_count[1])
-            I_ts[1,sweeps_per_sample*n+t] = Ψ[1]
+
+            step = n * sweeps_per_sample + t
+            do_one_MMC_step_1d(N,P,K,invN, Σ[1],M[1],Ξ[1],Ψ[1], A,ξ,d, β, seed_matrix[1], replica_swap_count[1],
+                               I_ts[0],step)
+
 
 
 
@@ -300,7 +313,7 @@ def run_trial_stats_1d(sys: SysConfig_1d, trial: TrialConfig_1d, rid: int) -> Tr
     seeds = _make_seed_matrix_1d(sys, rid)
     swap_count = np.zeros((2, sys.K-1), dtype=np.int64)
 
-    I_ts = np.zeros((2,trial.n_samples*trial.sweeps_per_sample,sys.K),dtype=np.int8)
+    I_ts = np.zeros((2,2*trial.n_samples*trial.sweeps_per_sample,sys.K),dtype=np.int8)
     """
     # Welford accumulators
     W_n    = np.zeros((2, sys.K), dtype=np.int64)

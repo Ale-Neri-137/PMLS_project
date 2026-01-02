@@ -13,3 +13,8 @@ runs/
 # Editor
 .vscode/
 
+
+# outputs
+*.pkl
+*.pkl.gz
+

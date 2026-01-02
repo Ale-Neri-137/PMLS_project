@@ -1,22 +1,102 @@
 
 import numpy as np
 from numba import njit
-from numba import int8, int64, float64, uint64, void, boolean
+from numba import int8, int64, float64, uint64, void, boolean,int32
 from dataclasses import dataclass
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 
 from .RNG_helpers import xorshift128p_next_float, derive_xorshift_state
-from .jitted_kernel import do_one_MMC_step
+from .jitted_kernel import do_one_Metropolis_sweep_return_ΔE,attempt_swaps,attempt_vertical_swaps,do_one_MMC_step
 from .init_and_checkpoints import sample_ξ, build_couplings_for_t_grid, init_spins,_make_seed_matrix
 from .init_and_checkpoints import SysConfig
 from .init_and_checkpoints import compute_M_from_σ_ξ, compute_E_from_M
 
 
 
+@njit(
+    void(
+        int64, int64, int64, float64, int64[::1],   # N, P, R, invN, k_start
+        int8[:,  ::1],                              # σ
+        float64[:,::1],                             # m
+        float64[::1],                               # E
+        int64[::1],                                 # I
+        float64[:,:,::1],                           # A
+        int8[:,  ::1],                              # ξ
+        float64[:,::1],                             # d
+        float64[::1],                               # β
+        uint64[:,::1],                              # seed_array
+        int64[::1],                                 # swap_count
+        int64[::1],int64[::1],                      # vertical_swap_count, vertical_swap_attempt
+        int64[:, ::1], int64[::1],                  # edges, order
+        int32[::1], int32[::1],                     # mark, token_arr
+        int64[::1],                                 # out_e,
+        int64[::1],                                 # b_of_r
+        int64[:,::1],int64),                        # I_ts, step
+    nogil=True, no_cpython_wrapper=True, fastmath=True
+)
+def do_one_MMC_step_stats(
+    N, P, R, invN, k_start,
+    σ, m, E, I,
+    A, ξ, d,
+    β, seed_array, swap_count,
+    vertical_swap_count, vertical_swap_attempt,
+    edge_list, order, mark, token_arr, out_e, 
+    b_of_r,I_ts,step
+):
+    """
+    One MMC macro-step for ONE PT chain:
+      - local update at each slot (Metropolis)
+      - even-edge swap pass
+      - local update again
+      - odd-edge swap pass
+      - local update again
+      - vertical swaps
+    """
+    # -------- first local sweep (then even swaps) --------
+    for r in range(R):
 
+        E[I[r]] += do_one_Metropolis_sweep_return_ΔE(
+                N, P, invN,
+                σ[I[r]], m[I[r]],
+                A[b_of_r[r]], ξ, d[b_of_r[r]],
+                β[r],
+                seed_array[r])
 
+    attempt_swaps(0, R,k_start, E, I, β, seed_array, swap_count)
+
+    I_ts[3*step]   = I 
+
+    # -------- second local sweep (then odd swaps) --------
+    for r in range(R):
+
+        E[I[r]] += do_one_Metropolis_sweep_return_ΔE(
+                N, P, invN,
+                σ[I[r]], m[I[r]],
+                A[b_of_r[r]], ξ, d[b_of_r[r]],
+                β[r],
+                seed_array[r])
+
+    attempt_swaps(1, R,k_start, E, I, β, seed_array, swap_count)
+
+    I_ts[3*step+1] = I 
+
+    # ----- third local sweep (then some vertical swaps) ---
+    for r in range(R):
+
+        E[I[r]] += do_one_Metropolis_sweep_return_ΔE(
+                N, P, invN,
+                σ[I[r]], m[I[r]],
+                A[b_of_r[r]], ξ, d[b_of_r[r]],
+                β[r],
+                seed_array[r])
+
+    attempt_vertical_swaps(N,P, σ,m,E,I, A, β, seed_array, vertical_swap_count, vertical_swap_attempt,
+                          edge_list, order, mark, token_arr, out_e,
+                          b_of_r)
+
+    I_ts[3*step+2] = I 
 
 @njit(nogil=False, no_cpython_wrapper=False, fastmath=True)
 def Simulate_two_replicas_stats_2d(
@@ -32,7 +112,7 @@ def Simulate_two_replicas_stats_2d(
     edge_list,                     # (E,2)
     order, mark, token_arr, out_e, # (2,*) work arrays (see runner)
     b_of_r,
-    Ψ_ts                           # (2, T, R) int64
+    Ψ_ts                           # (2, 3*T, R) int64
 ):
     # --- equilibrate ---
     for _ in range(equilibration_time):
@@ -74,7 +154,7 @@ def Simulate_two_replicas_stats_2d(
         for t in range(sweeps_per_sample):
             step = n * sweeps_per_sample + t
 
-            do_one_MMC_step(
+            do_one_MMC_step_stats(
                 N, P, R, invN, k_start,
                 Σ[0], M[0], Ξ[0], Ψ[0],
                 A, ξ, d,
@@ -83,11 +163,11 @@ def Simulate_two_replicas_stats_2d(
                 vertical_swap_count[0], vertical_swap_attempt[0],
                 edge_list,
                 order[0], mark[0], token_arr[0], out_e[0],
-                b_of_r
+                b_of_r,Ψ_ts[0],step
             )
-            Ψ_ts[0, step] = Ψ[0]
 
-            do_one_MMC_step(
+
+            do_one_MMC_step_stats(
                 N, P, R, invN, k_start,
                 Σ[1], M[1], Ξ[1], Ψ[1],
                 A, ξ, d,
@@ -96,9 +176,8 @@ def Simulate_two_replicas_stats_2d(
                 vertical_swap_count[1], vertical_swap_attempt[1],
                 edge_list,
                 order[1], mark[1], token_arr[1], out_e[1],
-                b_of_r
+                b_of_r,Ψ_ts[1],step
             )
-            Ψ_ts[1, step] = Ψ[1]
 
 
 @dataclass(frozen=True)
@@ -110,9 +189,10 @@ class TrialConfig:
 @dataclass
 class TrialResult:
     rid: int
-    beta_by_t: tuple[np.ndarray, ...]   # ragged (B,) of (K_b,)
-    acc_h_by_t: tuple[np.ndarray, ...]  # ragged (B,) of (K_b-1,)
-    acc_v: np.ndarray                   # (E,) accepted/attempted (avg over chains)
+    beta_by_t: tuple[np.ndarray, ...]   # (B,) each (K_b,)
+    acc_h_by_t: tuple[np.ndarray, ...]  # (B,) each (2, K_b-1)  per chain
+    attempted_v: np.ndarray             # (2, E) float64 (attempt counts)
+    acc_v: np.ndarray                   # (2, E) float64 acceptance per chain
     Ψ_ts: np.ndarray                    # (2, T, R) int64
 
 
@@ -191,7 +271,7 @@ def run_trial_stats(sys: SysConfig, trial: TrialConfig, rid: int,
 
     # Ψ time series
     T = trial.n_samples * trial.sweeps_per_sample
-    Ψ_ts = np.empty((2, T, sys.R), dtype=np.int64)
+    Ψ_ts = np.empty((2, 3*T, sys.R), dtype=np.int64)
 
     # run
     Simulate_two_replicas_stats_2d(
@@ -212,22 +292,24 @@ def run_trial_stats(sys: SysConfig, trial: TrialConfig, rid: int,
     steps = max(1, trial.n_samples * trial.sweeps_per_sample)
 
     # horizontal acceptance, sliced per ladder b
-    acc_h_flat = swap_count.mean(axis=0) / steps   # (R-1,)
+    acc_h_flat = swap_count.astype(np.float64) / steps   # (2,R-1,)
 
     acc_h_by_t = []
     beta_by_t  = []
     for b in range(sys.B):
         r0, r1 = sys.k_start[b], sys.k_start[b + 1]
         beta_by_t.append(sys.beta[r0:r1].copy())
-        acc_h_by_t.append(acc_h_flat[r0:r1-1].copy())   # length K_b-1
+        acc_h_by_t.append(acc_h_flat[:, r0:r1-1].copy())  # (2, K_b-1)
 
     # vertical acceptance per edge
     if E == 0:
-        acc_v = np.empty((0,), dtype=np.float64)
+        acc_v = np.empty((2,0), dtype=np.float64)
+        att = np.zeros((2, E), dtype=np.float64)
+        acc_v = np.zeros((2, E), dtype=np.float64)
     else:
-        att = vertical_swap_attempt.mean(axis=0).astype(np.float64)
-        acc = vertical_swap_count.mean(axis=0).astype(np.float64)
-        acc_v = np.zeros(E, dtype=np.float64)
+        att = vertical_swap_attempt.astype(np.float64)
+        acc = vertical_swap_count.astype(np.float64)
+        acc_v = np.zeros((2, E), dtype=np.float64)
         mask = att > 0
         acc_v[mask] = acc[mask] / att[mask]
 
@@ -235,6 +317,7 @@ def run_trial_stats(sys: SysConfig, trial: TrialConfig, rid: int,
         rid=rid,
         beta_by_t=tuple(beta_by_t),
         acc_h_by_t=tuple(acc_h_by_t),
+        attempted_v=att,
         acc_v=acc_v,
         Ψ_ts=Ψ_ts
     )
