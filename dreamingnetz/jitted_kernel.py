@@ -338,6 +338,12 @@ def do_one_MMC_step(
                 A[b_of_r[r]], ξ, d[b_of_r[r]],
                 β[r],
                 seed_array[r])
+        E[I[r]] += do_one_Metropolis_sweep_return_ΔE(
+                N, P, invN,
+                σ[I[r]], m[I[r]],
+                A[b_of_r[r]], ξ, d[b_of_r[r]],
+                β[r],
+                seed_array[r])
 
     attempt_swaps(0, R,k_start, E, I, β, seed_array, swap_count)
 
@@ -350,12 +356,24 @@ def do_one_MMC_step(
                 A[b_of_r[r]], ξ, d[b_of_r[r]],
                 β[r],
                 seed_array[r])
+        E[I[r]] += do_one_Metropolis_sweep_return_ΔE(
+                N, P, invN,
+                σ[I[r]], m[I[r]],
+                A[b_of_r[r]], ξ, d[b_of_r[r]],
+                β[r],
+                seed_array[r])
 
     attempt_swaps(1, R,k_start, E, I, β, seed_array, swap_count)
 
     # ----- third local sweep (then some vertical swaps) ---
     for r in range(R):
 
+        E[I[r]] += do_one_Metropolis_sweep_return_ΔE(
+                N, P, invN,
+                σ[I[r]], m[I[r]],
+                A[b_of_r[r]], ξ, d[b_of_r[r]],
+                β[r],
+                seed_array[r])
         E[I[r]] += do_one_Metropolis_sweep_return_ΔE(
                 N, P, invN,
                 σ[I[r]], m[I[r]],

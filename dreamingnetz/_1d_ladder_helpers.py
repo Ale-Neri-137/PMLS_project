@@ -74,7 +74,13 @@ def do_one_MMC_step_1d(
                 β[k],
                 seed_array[k]
             )
-
+        E[rep_k] += do_one_Metropolis_sweep_return_ΔE(
+                N, P, invN,
+                σ[rep_k], m[rep_k],
+                A, ξ, d,
+                β[k],
+                seed_array[k]
+            )
     attempt_swap_1d(0, K, E, I, β, seed_array, swap_count)
 
     I_ts[2*step]   = I
@@ -84,6 +90,14 @@ def do_one_MMC_step_1d(
         rep_k = I[k]  # actual replica index currently sitting at slot k
 
             # Metropolis returns ΔE (increment E[rep])
+        E[rep_k] += do_one_Metropolis_sweep_return_ΔE(
+                N, P, invN,
+                σ[rep_k], m[rep_k],
+                A, ξ, d,
+                β[k],
+                seed_array[k]
+            )
+                
         E[rep_k] += do_one_Metropolis_sweep_return_ΔE(
                 N, P, invN,
                 σ[rep_k], m[rep_k],
@@ -144,7 +158,7 @@ def Simulate_two_replicas_stats_1d( N,P,K,invN,
 
             step = n * sweeps_per_sample + t
             do_one_MMC_step_1d(N,P,K,invN, Σ[1],M[1],Ξ[1],Ψ[1], A,ξ,d, β, seed_matrix[1], replica_swap_count[1],
-                               I_ts[0],step)
+                               I_ts[1],step)
 
 
 
