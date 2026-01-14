@@ -1,11 +1,7 @@
 import numpy as np
 from typing import Dict, Any, Optional, Union, Literal, Iterable,Tuple
 from dataclasses import dataclass
-# ---------- utilities you already have ----------
-# get_perm_ts(res) -> (2,T,R)
-# estimate_P_pi_from_perm2(...)
-# estimate_lifted_P_pi_from_perm2(...)
-# lift_indices_for_set(...)
+
 @dataclass(frozen=True)
 class PTMeta:
     beta: np.ndarray      # (R,)
